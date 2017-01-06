@@ -7,34 +7,32 @@ import CoreGraphics
 ///
 open class SVGParser {
 
-	/// Parse an SVG file identified by the specified name and file extension.
-	/// - returns: Root node of the corresponding Macaw scene.
-	open class func parse(path: String, ofType: String = "svg") -> Node {
-		let path = Bundle.main.path(forResource: path, ofType: ofType)
-		let text = try! String(contentsOfFile: path!, encoding: String.Encoding.utf8)
-		return SVGParser.parse(text: text)
-	}
-
-	/// Parse the specified content of an SVG file.
-	/// - returns: Root node of the corresponding Macaw scene.
-	open class func parse(text: String) -> Node {
-		return SVGParser(text).parse()
-	}
-
-	let moveToAbsolute = Character("M")
-	let moveToRelative = Character("m")
-	let lineToAbsolute = Character("L")
-	let lineToRelative = Character("l")
-	let lineHorizontalAbsolute = Character("H")
-	let lineHorizontalRelative = Character("h")
-	let lineVerticalAbsolute = Character("V")
-	let lineVerticalRelative = Character("v")
-	let curveToAbsolute = Character("C")
-	let curveToRelative = Character("c")
-	let smoothCurveToAbsolute = Character("S")
-	let smoothCurveToRelative = Character("s")
-	let closePathAbsolute = Character("Z")
-	let closePathRelative = Character("z")
+    /// Parse an SVG file identified by the specified bundle, name and file extension.
+    /// - returns: Root node of the corresponding Macaw scene.
+    open class func parse(bundle: Bundle, path: String, ofType: String = "svg") -> Node? {
+        guard let path = bundle.path(forResource: path, ofType: ofType) else {
+            return .none
+        }
+        do {
+            let text = try String(contentsOfFile: path, encoding: String.Encoding.utf8)
+            return SVGParser.parse(text: text)
+        } catch _ {
+            return .none
+        }
+    }
+    
+    /// Parse an SVG file identified by the specified name and file extension.
+    /// - returns: Root node of the corresponding Macaw scene.
+    open class func parse(path: String, ofType: String = "svg") -> Node? {
+        return SVGParser.parse(bundle: Bundle.main, path: path, ofType: ofType)
+    }
+    
+    /// Parse the specified content of an SVG file.
+    /// - returns: Root node of the corresponding Macaw scene.
+    open class func parse(text: String) -> Node {
+        return SVGParser(text).parse()
+    }
+    
 	let availableStyleAttributes = ["stroke", "stroke-width", "stroke-opacity", "stroke-dasharray", "stroke-linecap", "stroke-linejoin",
 		"fill", "fill-opacity",
 		"stop-color", "stop-opacity",
@@ -47,6 +45,7 @@ open class SVGParser {
 	fileprivate var nodes = [Node]()
 	fileprivate var defNodes = [String: Node]()
 	fileprivate var defFills = [String: Fill]()
+    fileprivate var defMasks = [String: Shape]()
 
 	fileprivate enum PathCommandType {
 		case moveTo
@@ -110,7 +109,12 @@ open class SVGParser {
 			}
 			if let fill = parseFill(child) {
 				self.defFills[id] = fill
+                continue
 			}
+            if let mask = parseMask(child) {
+                self.defMasks[id] = mask
+                continue
+            }
 		}
 	}
 
@@ -153,6 +157,8 @@ open class SVGParser {
 				return parseText(node, fill: getFillColor(styleAttributes), opacity: getOpacity(styleAttributes), fontName: getFontName(styleAttributes), fontSize: getFontSize(styleAttributes), pos: position)
 			case "use":
 				return parseUse(node, fill: getFillColor(styleAttributes), stroke: getStroke(styleAttributes), pos: position, opacity: getOpacity(styleAttributes))
+            case "mask":
+                break
 			default:
 				print("SVG parsing error. Shape \(element.name) not supported")
 				return .none
@@ -187,8 +193,18 @@ open class SVGParser {
 				groupNodes.append(node)
 			}
 		}
-		return Group(contents: groupNodes, place: position)
+        return Group(contents: groupNodes, place: position)
 	}
+    
+    fileprivate func getMask(mask: String) -> Locus? {
+        if let maskIdenitifierMatcher = SVGParserRegexHelper.getMaskIdenitifierMatcher() {
+            let fullRange = NSMakeRange(0, mask.characters.count)
+            if let match = maskIdenitifierMatcher.firstMatch(in: mask, options: .reportCompletion, range: fullRange), let maskReferenceNode = self.defMasks[(mask as NSString).substring(with: match.rangeAt(1))] {
+                return maskReferenceNode.form
+            }
+        }
+        return .none
+    }
 
 	fileprivate func getPosition(_ element: XMLElement) -> Transform {
 		guard let transformAttribute = element.attributes["transform"] else {
@@ -229,10 +245,10 @@ open class SVGParser {
 			case "rotate":
 				if let angle = Double(values[0]) {
 					if values.count == 1 {
-						finalTransform = transform.rotate(angle: angle)
+						finalTransform = transform.rotate(angle: degreesToRadians(angle))
 					} else if values.count == 3 {
 						if let x = Double(values[1]), let y = Double(values[2]) {
-							finalTransform = transform.move(dx: x, dy: y).rotate(angle: angle).move(dx: -x, dy: -y)
+							finalTransform = transform.move(dx: x, dy: y).rotate(angle: degreesToRadians(angle)).move(dx: -x, dy: -y)
 						}
 					}
 				}
@@ -320,7 +336,7 @@ open class SVGParser {
 
 	fileprivate func getFillColor(_ styleParts: [String: String]) -> Fill? {
 		guard let fillColor = styleParts["fill"] else {
-			return .none
+			return Color.black
 		}
 		if fillColor == "none" {
 			return .none
@@ -329,6 +345,9 @@ open class SVGParser {
 		if let fillOpacity = styleParts["fill-opacity"] {
 			opacity = Double(fillOpacity.replacingOccurrences(of: " ", with: "")) ?? 1
 		}
+        if let defaultColor = SVGConstants.colorList[fillColor] {
+            return Color(val: defaultColor)
+        }
 		if fillColor.hasPrefix("url") {
 			let index = fillColor.characters.index(fillColor.startIndex, offsetBy: 4)
 			let id = fillColor.substring(from: index)
@@ -376,12 +395,15 @@ open class SVGParser {
 	}
 
 	fileprivate func getStrokeWidth(_ styleParts: [String: String]) -> Double {
-		var width: Double = 1
 		if let strokeWidth = styleParts["stroke-width"] {
-			let strokeWidth = strokeWidth.replacingOccurrences(of: " ", with: "")
-			width = Double(strokeWidth)!
+            let characterSet = NSCharacterSet.decimalDigits.union(NSCharacterSet.punctuationCharacters).inverted
+            let digitsArray = strokeWidth.components(separatedBy: characterSet)
+            let digits = digitsArray.joined(separator: "")
+            if let value = NumberFormatter().number(from: digits) {
+                return value.doubleValue
+            }
 		}
-		return width
+        return 1
 	}
 
 	fileprivate func getStrokeCap(_ styleParts: [String: String]) -> LineCap {
@@ -479,16 +501,18 @@ open class SVGParser {
 		return Circle(cx: getDoubleValue(element, attribute: "cx") ?? 0, cy: getDoubleValue(element, attribute: "cy") ?? 0, r: r)
 	}
 
-	fileprivate func parseEllipse(_ ellipse: XMLIndexer) -> Ellipse? {
+	fileprivate func parseEllipse(_ ellipse: XMLIndexer) -> Arc? {
 		guard let element = ellipse.element,
 			let rx = getDoubleValue(element, attribute: "rx"),
 			let ry = getDoubleValue(element, attribute: "ry")
 		, rx > 0 && ry > 0 else {
-
 			return .none
-		}
-
-		return Ellipse(cx: getDoubleValue(element, attribute: "cx") ?? 0, cy: getDoubleValue(element, attribute: "cy") ?? 0, rx: rx, ry: ry)
+        }
+        return Arc(
+            ellipse: Ellipse(cx: getDoubleValue(element, attribute: "cx") ?? 0, cy: getDoubleValue(element, attribute: "cy") ?? 0, rx: rx, ry: ry),
+            shift: 0,
+            extent: degreesToRadians(360)
+        )
 	}
 
 	fileprivate func parsePolygon(_ polygon: XMLIndexer) -> Polygon? {
@@ -633,7 +657,7 @@ open class SVGParser {
 			let attributes = getStyleAttributes([:], element: element)
 
 			return Text(text: text, font: getFont(attributes, fontName: fontName, fontSize: fontSize),
-				fill: getFillColor(attributes) ?? fill ?? Color.black, baseline: .alphabetic,
+				fill: fill ?? getFillColor(attributes) ?? Color.black, baseline: .alphabetic,
 				place: pos, opacity: getOpacity(attributes) ?? opacity)
 	}
 
@@ -679,23 +703,67 @@ open class SVGParser {
 		}
 		node.place = pos.move(dx: getDoubleValue(element, attribute: "x") ?? 0, dy: getDoubleValue(element, attribute: "y") ?? 0)
 		node.opacity = opacity
-		if let shape = node as? Shape {
-			if let color = fill {
-				shape.fill = color
-			}
-			if let line = stroke {
-				shape.stroke = line
-			}
-			return shape
-		}
-		if let text = node as? Text {
-			if let color = fill {
-				text.fill = color
-			}
-			return text
-		}
-		return node
+        let maskString = element.attributes["mask"] ?? ""
+		return parseUseNode(node: node, fill: fill, stroke: stroke, mask: maskString)
 	}
+    
+    fileprivate func parseUseNode(node: Node, fill: Fill?, stroke: Stroke?, mask: String) -> Node {
+        if let shape = node as? Shape {
+            if let color = fill {
+                shape.fill = color
+            }
+            if let line = stroke {
+                shape.stroke = line
+            }
+            if let maskIdenitifierMatcher = SVGParserRegexHelper.getMaskIdenitifierMatcher() {
+                let fullRange = NSMakeRange(0, mask.characters.count)
+                if let match = maskIdenitifierMatcher.firstMatch(in: mask, options: .reportCompletion, range: fullRange), let maskReferenceNode = self.defMasks[(mask as NSString).substring(with: match.rangeAt(1))] {
+                    shape.clip = maskReferenceNode.form
+                    shape.fill = .none
+                }
+            }
+            return shape
+        }
+        if let text = node as? Text {
+            if let color = fill {
+                text.fill = color
+            }
+            return text
+        }
+        if let group = node as? Group {
+            group.contents.forEach { node in
+                parseUseNode(node: node, fill: fill, stroke: stroke, mask: mask)
+            }
+            return group
+        }
+        return node
+    }
+    
+    fileprivate func parseMask(_ mask: XMLIndexer) -> Shape? {
+        guard let element = mask.element else {
+            return .none
+        }
+        var node: Node?
+        mask.children.forEach { indexer in
+            if let useNode = parseUse(indexer, fill: .none, stroke: .none, pos: Transform(), opacity: 0) {
+                node = useNode
+            } else if let contentNode = parseNode(indexer) {
+                node = contentNode
+            }
+        }
+        guard let shape = node as? Shape else {
+            return .none
+        }
+        let maskShape: Shape
+        if let circle = shape.form as? Circle {
+            maskShape = Shape(form: circle.arc(shift: 0, extent: degreesToRadians(360)))
+        } else {
+            maskShape = Shape(form: shape.form)
+        }
+        let maskStyleAttributes = getStyleAttributes([:], element: element)
+        maskShape.fill = getFillColor(maskStyleAttributes)
+        return maskShape
+    }
 
 	fileprivate func parseLinearGradient(_ gradient: XMLIndexer) -> Fill? {
 		guard let element = gradient.element else {
@@ -825,66 +893,43 @@ open class SVGParser {
 	}
 
 	fileprivate func parsePath(_ path: XMLIndexer) -> Path? {
-		if let dAttr = path.element!.attributes["d"] {
-			let pathSegments = parseCommands(dAttr)
-			return Path(segments: pathSegments)
+		if let dAttr = path.element?.attributes["d"] {
+            return Path(segments: parsePathCommands(dAttr))
 		}
 		return .none
 	}
+    
+    fileprivate func parsePathCommands(_ d: String) -> [PathSegment] {
+        var pathCommands = [PathCommand]()
+        var pathCommandName: NSString? = ""
+        var pathCommandValues: NSString? = ""
+        let scanner = Scanner(string: d)
+        let set = CharacterSet(charactersIn: SVGConstants.pathCommands.joined())
+        let charCount = d.characters.count
+        repeat {
+            scanner.scanCharacters(from: set, into: &pathCommandName)
+            scanner.scanUpToCharacters(from: set, into: &pathCommandValues)
+            pathCommands.append(
+                PathCommand(
+                    type: getCommandType(pathCommandName! as String),
+                    expression: pathCommandValues! as String,
+                    absolute: isAbsolute(pathCommandName! as String)
+                )
+            )
+            if scanner.scanLocation == charCount {
+                break
+            }
+        } while pathCommandValues!.length > 0
+        var commands = [PathSegment]()
+        pathCommands.forEach { command in
+            if let parsedCommand = parseCommand(command) {
+                commands.append(parsedCommand)
+            }
+        }
+        return commands
+    }
 
-	fileprivate func parseCommands(_ d: String) -> [PathSegment] {
-		var pathCommands = [PathCommand]()
-		var commandChar = Character(" ")
-		var commandString = ""
-
-		d.characters.forEach { character in
-			if isCommandCharacter(character) {
-				if !commandString.isEmpty {
-					pathCommands.append(
-						PathCommand(
-							type: getCommandType(commandChar),
-							expression: commandString,
-							absolute: isAbsolute(commandChar)
-						)
-					)
-				}
-				if character == closePathAbsolute || character == closePathRelative {
-					pathCommands.append(
-						PathCommand(
-							type: getCommandType(character),
-							expression: commandString,
-							absolute: true
-						)
-					)
-				}
-				commandString = ""
-				commandChar = character
-			} else {
-				commandString.append(character)
-			}
-		}
-
-		if !commandString.isEmpty && !(commandChar == " ") {
-			pathCommands.append(
-				PathCommand(type: getCommandType(commandChar),
-					expression: commandString,
-					absolute: isAbsolute(commandChar)
-				)
-			)
-		}
-
-		var commands = [PathSegment]()
-
-		pathCommands.forEach { command in
-			if let parsedCommand = parseCommand(command) {
-				commands.append(parsedCommand)
-			}
-		}
-
-		return commands
-	}
-
-	fileprivate func parseCommand(_ command: PathCommand) -> PathSegment? {
+    fileprivate func parseCommand(_ command: PathCommand) -> PathSegment? {
 		var characterSet = CharacterSet()
 		characterSet.insert(" ")
 		characterSet.insert(",")
@@ -927,23 +972,23 @@ open class SVGParser {
 			if separatedValues.count < 1 {
 				return .none
 			}
-
-			guard let x = Double(separatedValues[0]) else {
-				return .none
-			}
-
-			return PathSegment(type: command.absolute ? .H : .h, data: [x])
+            
+            guard let x = Double(separatedValues[0]) else {
+                return .none
+            }
+            
+            return PathSegment(type: command.absolute ? .H : .h, data: [x])
 
 		case .lineV:
 			if separatedValues.count < 1 {
 				return .none
 			}
-
-			guard let y = Double(separatedValues[0]) else {
-				return .none
-			}
-
-			return PathSegment(type: command.absolute ? .V : .v, data: [y])
+            
+            guard let y = Double(separatedValues[0]) else {
+                return .none
+            }
+            
+            return PathSegment(type: command.absolute ? .V : .v, data: [y])
 
 		case .curveTo:
             var data = [Double]()
@@ -984,128 +1029,93 @@ open class SVGParser {
 		var values = [String]()
 		var value = String()
 		var e = false
+        
+        expression.unicodeScalars.forEach { scalar in
+            if scalar == "e" {
+                e = true
+            }
+            if scalar == "-" && !e {
+                if !value.isEmpty {
+                    values.append(value)
+                    value = String()
+                }
+                e = false
+            }
+            
+            value.append("\(scalar)")
+        }
 
-		expression.characters.forEach { c in
-			if c == "e" {
-				e = true
-			}
-			if c == "-" && !e {
-				if value.characters.count != 0 {
-					values.append(value)
-					value = String()
-				}
-				e = false
-			}
-
-			value.append(c)
-		}
-
-		if value.characters.count != 0 {
+		if !value.isEmpty {
 			values.append(value)
 		}
 
 		return values
 	}
 
-	fileprivate func isCommandCharacter(_ character: Character) -> Bool {
-		switch character {
-		case moveToAbsolute:
+	fileprivate func isAbsolute(_ commandString: String) -> Bool {
+		switch commandString {
+		case SVGConstants.moveToAbsolute:
 			return true
-		case moveToRelative:
-			return true
-		case lineToAbsolute:
-			return true
-		case lineToRelative:
-			return true
-		case lineHorizontalAbsolute:
-			return true
-		case lineHorizontalRelative:
-			return true
-		case lineVerticalAbsolute:
-			return true
-		case lineVerticalRelative:
-			return true
-		case curveToAbsolute:
-			return true
-		case curveToRelative:
-			return true
-		case smoothCurveToAbsolute:
-			return true
-		case smoothCurveToRelative:
-			return true
-		case closePathAbsolute:
-			return true
-		case closePathRelative:
-			return true
-		default:
+		case SVGConstants.moveToRelative:
 			return false
-		}
-	}
-
-	fileprivate func isAbsolute(_ character: Character) -> Bool {
-		switch character {
-		case moveToAbsolute:
+		case SVGConstants.lineToAbsolute:
 			return true
-		case moveToRelative:
+		case SVGConstants.lineToRelative:
 			return false
-		case lineToAbsolute:
+		case SVGConstants.lineHorizontalAbsolute:
 			return true
-		case lineToRelative:
+		case SVGConstants.lineHorizontalRelative:
 			return false
-		case lineHorizontalAbsolute:
+		case SVGConstants.lineVerticalAbsolute:
 			return true
-		case lineHorizontalRelative:
+		case SVGConstants.lineVerticalRelative:
 			return false
-		case lineVerticalAbsolute:
+		case SVGConstants.curveToAbsolute:
 			return true
-		case lineVerticalRelative:
+		case SVGConstants.curveToRelative:
 			return false
-		case curveToAbsolute:
+		case SVGConstants.smoothCurveToAbsolute:
 			return true
-		case curveToRelative:
+		case SVGConstants.smoothCurveToRelative:
 			return false
-		case smoothCurveToAbsolute:
+		case SVGConstants.closePathAbsolute:
 			return true
-		case smoothCurveToRelative:
-			return false
-		case closePathAbsolute:
-			return true
-		case closePathRelative:
+		case SVGConstants.closePathRelative:
 			return false
 		default:
 			return true
 		}
 	}
 
-	fileprivate func getCommandType(_ character: Character) -> PathCommandType {
-		switch character {
-		case moveToAbsolute:
+	fileprivate func getCommandType(_ commandString: String) -> PathCommandType {
+		switch commandString {
+		case SVGConstants.moveToAbsolute:
 			return .moveTo
-		case moveToRelative:
+		case SVGConstants.moveToRelative:
 			return .moveTo
-		case lineToAbsolute:
+		case SVGConstants.lineToAbsolute:
 			return .lineTo
-		case lineToRelative:
+		case SVGConstants.lineToRelative:
 			return .lineTo
-		case lineVerticalAbsolute:
+		case SVGConstants.lineVerticalAbsolute:
 			return .lineV
-		case lineVerticalRelative:
+		case SVGConstants.lineVerticalRelative:
 			return .lineV
-		case lineHorizontalAbsolute:
+		case SVGConstants.lineHorizontalAbsolute:
 			return .lineH
-		case lineHorizontalRelative:
+		case SVGConstants.lineHorizontalRelative:
 			return .lineH
-		case curveToAbsolute:
+		case SVGConstants.curveToAbsolute:
 			return .curveTo
-		case curveToRelative:
+		case SVGConstants.curveToRelative:
 			return .curveTo
-		case smoothCurveToAbsolute:
+		case SVGConstants.smoothCurveToAbsolute:
 			return .smoothCurveTo
-		case smoothCurveToRelative:
+		case SVGConstants.smoothCurveToRelative:
 			return .smoothCurveTo
-		case closePathAbsolute:
+		case SVGConstants.closePathAbsolute:
 			return .closePath
-		case closePathRelative:
+		case SVGConstants.closePathRelative:
 			return .closePath
 		default:
 			return .none
@@ -1186,7 +1196,6 @@ open class SVGParser {
 	}
 
 	fileprivate func copyNode(_ referenceNode: Node) -> Node? {
-
 		let pos = referenceNode.place
 		let opaque = referenceNode.opaque
 		let visible = referenceNode.visible
@@ -1213,4 +1222,9 @@ open class SVGParser {
 		}
 		return .none
 	}
+    
+    fileprivate func degreesToRadians(_ degrees: Double) -> Double {
+        return degrees * .pi / 180
+    }
+    
 }
